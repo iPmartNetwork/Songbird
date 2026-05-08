@@ -24,6 +24,8 @@ import { buildTimestampSchedule } from "./lib/timeUtils.js";
 import { isLoopbackRequest, parseUploadFileMetadata } from "./lib/requestUtils.js";
 import { USER_COLORS, setUserColor } from "./settings/colors.js";
 import { readEnvBool, readEnvInt } from "./settings/env.js";
+import { createServer } from "node:http";
+import { Server as SocketIOServer } from "socket.io";
 import {
   addChatMember,
   adminGetAll,
@@ -92,8 +94,9 @@ import {
   upsertPushSubscription,
   deletePushSubscription,
   listPushSubscriptionsByUserIds,
-  getTotalUnreadCount,
   listMutedUserIdsForChat,
+  getMessageReactions,
+  toggleMessageReaction,
 } from "./db.js";
 
 process.title = "songbird-server";
@@ -196,49 +199,39 @@ const staticLimiter = rateLimit({
   max: 1000,
 });
 
-const MB = 1024 * 1024;
 const USERNAME_REGEX = /^[a-z0-9._]+$/;
-const readEnvSizeMbAsBytes = (mbKeys, legacyByteKeys, fallbackMb, options = {}) => {
-  const mbValue = readEnvInt(mbKeys, null, options);
-  if (mbValue !== null) return mbValue * MB;
-  return readEnvInt(legacyByteKeys, fallbackMb * MB, { min: 1024 });
-};
-
-const USERNAME_MAX = readEnvInt(["USERNAME_MAX_CHARS", "USERNAME_MAX"], 16, {
-  min: 3,
-  max: 32,
-});
-const NICKNAME_MAX = readEnvInt(["NICKNAME_MAX_CHARS", "NICKNAME_MAX"], 24, {
-  min: 3,
-  max: 64,
-});
+const USERNAME_MAX = readEnvInt("USERNAME_MAX", 16, { min: 3, max: 32 });
+const NICKNAME_MAX = readEnvInt("NICKNAME_MAX", 24, { min: 3, max: 64 });
 const MESSAGE_MAX_CHARS = readEnvInt(
   ["MESSAGE_MAX_CHARS", "MESSAGE_MAX"],
   4000,
   { min: 1, max: 20000 },
 );
-const ACCOUNT_CREATION = readEnvBool(["SIGN_UP", "ACCOUNT_CREATION"], true);
+const ACCOUNT_CREATION = readEnvBool("ACCOUNT_CREATION", true);
+const ADMIN_USERNAMES = String(
+  process.env.ADMIN_USERNAMES || process.env.BIRDX_ADMIN_USERNAMES || "",
+)
+  .split(/[,\s]+/)
+  .map((item) => item.trim().toLowerCase())
+  .filter(Boolean);
+const vapid = ensureValidVapidKeys({ projectRootDir, fs, path, webpush });
 const dataDir = path.resolve(serverDir, "..", "data");
-const vapid = ensureValidVapidKeys({ projectRootDir, dataDir, fs, path, webpush });
 const uploadRootDir = path.join(dataDir, "uploads", "messages");
 const avatarUploadRootDir = path.join(dataDir, "uploads", "avatars");
 
-const FILE_UPLOAD_MAX_SIZE = readEnvSizeMbAsBytes(
-  "FILE_UPLOAD_MAX_SIZE_MB",
+const FILE_UPLOAD_MAX_SIZE = readEnvInt(
   "FILE_UPLOAD_MAX_SIZE",
-  25,
-  { min: 1 },
+  25 * 1024 * 1024,
+  { min: 1024 },
 );
 
 const FILE_UPLOAD_MAX_FILES = readEnvInt("FILE_UPLOAD_MAX_FILES", 10, {
   min: 1,
 });
 
-const FILE_UPLOAD_MAX_TOTAL_SIZE = readEnvSizeMbAsBytes(
-  "FILE_UPLOAD_MAX_TOTAL_SIZE_MB",
+const FILE_UPLOAD_MAX_TOTAL_SIZE = readEnvInt(
   "FILE_UPLOAD_MAX_TOTAL_SIZE",
-  75,
-  { min: 1 },
+  78643200,
 );
 
 const MESSAGE_FILE_RETENTION_DAYS = readEnvInt("MESSAGE_FILE_RETENTION", 7, {
@@ -303,7 +296,6 @@ const pushService = createPushService({
   webpush,
   listPushSubscriptionsByUserIds,
   deletePushSubscription,
-  getTotalUnreadCount,
   vapid,
 });
 const { PUSH_ENABLED, VAPID_PUBLIC_KEY, sendPushNotificationToUsers } = pushService;
@@ -372,6 +364,37 @@ const {
   requireSessionUsernameMatch,
 } = sessionHelpers;
 
+function bootstrapEnvAdmins() {
+  if (!ADMIN_USERNAMES.length) return;
+  try {
+    const placeholders = ADMIN_USERNAMES.map(() => "?").join(", ");
+    const rows = adminGetAll(
+      `SELECT id, username FROM users WHERE lower(username) IN (${placeholders})`,
+      ADMIN_USERNAMES,
+    );
+    if (!rows.length) {
+      console.warn(
+        "[admin] ADMIN_USERNAMES is set, but no matching users were found:",
+        ADMIN_USERNAMES.join(", "),
+      );
+      return;
+    }
+    adminRun(
+      `UPDATE users
+       SET role = 'admin', banned = 0
+       WHERE lower(username) IN (${placeholders})`,
+      ADMIN_USERNAMES,
+    );
+    adminSave();
+    console.log(
+      "[admin] Bootstrapped admin users:",
+      rows.map((row) => row.username).join(", "),
+    );
+  } catch (error) {
+    console.warn("[admin] Unable to bootstrap ADMIN_USERNAMES:", String(error?.message || error));
+  }
+}
+
 function backfillStorageEncryption() {
   if (!storageEncryption.isEnabled()) return;
 
@@ -411,24 +434,10 @@ function backfillStorageEncryption() {
       }
     });
 
-    let encryptedAvatars = 0;
-    if (fs.existsSync(avatarUploadRootDir)) {
-      fs.readdirSync(avatarUploadRootDir, { withFileTypes: true }).forEach(
-        (entry) => {
-          if (!entry.isFile()) return;
-
-          const filePath = path.join(avatarUploadRootDir, entry.name);
-          if (storageEncryption.encryptFileInPlace(filePath)) {
-            encryptedAvatars += 1;
-          }
-        },
-      );
-    }
-
-    if (encryptedMessages > 0 || encryptedFiles > 0 || encryptedAvatars > 0) {
+    if (encryptedMessages > 0 || encryptedFiles > 0) {
       adminSave();
       console.log(
-        `[storage-encryption] encrypted ${encryptedMessages} message(s), ${encryptedFiles} file(s), and ${encryptedAvatars} avatar file(s) at rest.`,
+        `[storage-encryption] encrypted ${encryptedMessages} message(s) and ${encryptedFiles} file(s) at rest.`,
       );
     }
   } catch (error) {
@@ -438,7 +447,13 @@ function backfillStorageEncryption() {
   }
 }
 
-registerUploadRoutes(app, { adminGetRow });
+registerUploadRoutes(app, { express, adminGetRow });
+
+
+
+
+
+
 
 const apiDeps = {
   ALLOWED_AVATAR_MIME_TYPES,
@@ -454,6 +469,7 @@ const apiDeps = {
   USERNAME_MAX,
   MESSAGE_MAX_CHARS,
   ACCOUNT_CREATION,
+  ADMIN_USERNAMES,
   USERNAME_REGEX,
   VAPID_PUBLIC_KEY: PUSH_ENABLED ? VAPID_PUBLIC_KEY : "",
   addChatMember,
@@ -569,6 +585,8 @@ const apiDeps = {
   upsertPushSubscription,
   sendPushNotificationToUsers,
   storageEncryption,
+  getMessageReactions,
+  toggleMessageReaction,
 };
 
 registerApiRoutes(app, apiDeps);
@@ -787,8 +805,176 @@ if (MESSAGE_TEXT_RETENTION_DAYS > 0) {
   }
 }
 
+bootstrapEnvAdmins();
 backfillStorageEncryption();
 
-app.listen(port, () => {
-  console.log(`Songbird server running on http://localhost:${port}`);
+const httpServer = createServer(app);
+
+const io = new SocketIOServer(httpServer, {
+  cors: {
+    origin: "*",
+  },
+});
+
+const activeCalls = new Map();
+const liveCalls = new Map();
+
+function parseCallRoomChatId(roomId) {
+  const match = String(roomId || "").match(/^chat-(\d+)$/);
+  if (!match) return 0;
+  return Number(match[1] || 0);
+}
+
+async function notifyIncomingCallByPush({
+  roomId,
+  chatId,
+  callerUserId,
+  callerName,
+}) {
+  const targetChatId = Number(chatId || parseCallRoomChatId(roomId) || 0);
+  if (!targetChatId) return;
+  const chat = findChatById(targetChatId);
+  if (!chat || String(chat.type || "").toLowerCase() !== "dm") return;
+
+  const members = listChatMembers(targetChatId);
+  const mutedRows = listMutedUserIdsForChat(targetChatId);
+  const mutedIds = new Set(
+    mutedRows.map((row) => Number(row?.user_id || 0)).filter(Boolean),
+  );
+  const callerId = Number(callerUserId || 0);
+  const recipientIds = members
+    .map((member) => Number(member?.id || 0))
+    .filter(
+      (memberId) =>
+        Number.isFinite(memberId) &&
+        memberId > 0 &&
+        memberId !== callerId &&
+        !mutedIds.has(memberId),
+    );
+  if (!recipientIds.length) return;
+
+  await sendPushNotificationToUsers(recipientIds, {
+    title: "Incoming voice call",
+    body: `${callerName || "Someone"} is calling...`,
+    data: {
+      type: "incoming_call",
+      chatId: targetChatId,
+      roomId,
+      url: `/chat?openChatId=${encodeURIComponent(String(targetChatId))}`,
+    },
+  });
+}
+
+io.on("connection", (socket) => {
+  console.log("SOCKET CONNECTED:", socket.id);
+  const socketCallRooms = new Set();
+
+  socket.on("join-call", (roomId) => {
+    if (!roomId) return;
+    console.log("JOIN CALL:", socket.id, roomId);
+    socket.join(roomId);
+    socketCallRooms.add(roomId);
+
+    const activeCall = activeCalls.get(roomId);
+    if (activeCall && activeCall.callerSocketId !== socket.id) {
+      console.log("SEND PENDING INCOMING CALL:", socket.id, roomId);
+      socket.emit("incoming-call", activeCall);
+    }
+  });
+
+  socket.on("leave-call", (roomId) => {
+    if (!roomId) return;
+    console.log("LEAVE CALL:", socket.id, roomId);
+    activeCalls.delete(roomId);
+    liveCalls.delete(roomId);
+    socket.leave(roomId);
+    socket.to(roomId).emit("call-ended", { roomId });
+  });
+
+  socket.on("call-user", ({ roomId, chatId, callerUserId, callerUsername, callerName }) => {
+    if (!roomId) return;
+    socket.join(roomId);
+    socketCallRooms.add(roomId);
+
+    const payload = {
+      roomId,
+      chatId: Number(chatId || parseCallRoomChatId(roomId) || 0) || null,
+      callerUserId: Number(callerUserId || 0) || null,
+      callerUsername: callerUsername || "",
+      callerName: callerName || "Someone",
+      callerSocketId: socket.id,
+    };
+
+    activeCalls.set(roomId, payload);
+
+    console.log("CALL USER:", socket.id, roomId, callerName);
+    console.log(
+      "ROOM MEMBERS:",
+      roomId,
+      Array.from(io.sockets.adapter.rooms.get(roomId) || []),
+    );
+
+    socket.to(roomId).emit("incoming-call", payload);
+    notifyIncomingCallByPush(payload).catch((error) => {
+      console.warn("[call] incoming-call push failed:", String(error?.message || error));
+    });
+    console.log("INCOMING CALL EMITTED:", roomId);
+  });
+
+  socket.on("accept-call", ({ roomId }) => {
+    if (!roomId) return;
+    console.log("ACCEPT CALL:", socket.id, roomId);
+    socket.join(roomId);
+    socketCallRooms.add(roomId);
+    const activeCall = activeCalls.get(roomId);
+    if (activeCall?.callerSocketId) {
+      liveCalls.set(roomId, new Set([activeCall.callerSocketId, socket.id]));
+    }
+    activeCalls.delete(roomId);
+    socket.to(roomId).emit("call-accepted", { roomId });
+  });
+
+  socket.on("reject-call", ({ roomId }) => {
+    if (!roomId) return;
+    console.log("REJECT CALL:", socket.id, roomId);
+    activeCalls.delete(roomId);
+    socket.to(roomId).emit("call-rejected", { roomId });
+  });
+
+  socket.on("offer", ({ roomId, offer }) => {
+    if (!roomId || !offer) return;
+    console.log("OFFER:", socket.id, roomId);
+    socket.to(roomId).emit("offer", offer);
+  });
+
+  socket.on("answer", ({ roomId, answer }) => {
+    if (!roomId || !answer) return;
+    console.log("ANSWER:", socket.id, roomId);
+    socket.to(roomId).emit("answer", answer);
+  });
+
+  socket.on("ice-candidate", ({ roomId, candidate }) => {
+    if (!roomId || !candidate) return;
+    socket.to(roomId).emit("ice-candidate", candidate);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("SOCKET DISCONNECTED:", socket.id);
+    for (const [roomId, activeCall] of activeCalls.entries()) {
+      if (activeCall?.callerSocketId === socket.id) {
+        activeCalls.delete(roomId);
+        socket.to(roomId).emit("call-ended", { roomId });
+      }
+    }
+    for (const roomId of socketCallRooms) {
+      const participants = liveCalls.get(roomId);
+      if (!participants?.has(socket.id)) continue;
+      liveCalls.delete(roomId);
+      socket.to(roomId).emit("call-ended", { roomId });
+    }
+  });
+});
+
+httpServer.listen(port, () => {
+  console.log(`BirdX server running on http://localhost:${port}`);
 });
