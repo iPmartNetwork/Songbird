@@ -495,8 +495,6 @@ label:hover .icon-anim-slide {
 
 button:hover .icon-anim-pop,
 button:focus-visible .icon-anim-pop,
-a:hover .icon-anim-pop,
-a:focus-visible .icon-anim-pop,
 label:hover .icon-anim-pop {
   animation: icon-pop 300ms ease-out 1 both;
 }
@@ -603,35 +601,6 @@ label:hover .icon-anim-drop {
   transform-origin: top center;
 }
 
-@keyframes sb-message-build-in {
-  0% {
-    opacity: 0;
-    transform: translateY(20px) scale(0.985);
-    filter: saturate(0.9);
-  }
-  55% {
-    opacity: 1;
-    transform: translateY(-2px) scale(1);
-    filter: saturate(1);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-    filter: saturate(1);
-  }
-}
-
-.sb-message-build-in {
-  transform-origin: bottom center;
-  animation: sb-message-build-in 260ms cubic-bezier(0.22, 0.88, 0.24, 1) 1 both;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .sb-message-build-in {
-    animation: none;
-  }
-}
-
 .sb-markdown,
 .sb-markdown-inline {
   line-height: 1.45;
@@ -639,16 +608,10 @@ label:hover .icon-anim-drop {
 
 .sb-markdown p {
   margin: 0;
-  unicode-bidi: plaintext;
-  text-align: start;
 }
 
 .sb-markdown p + p {
   margin-top: 0.25rem;
-}
-
-.sb-markdown-spacer {
-  height: 0.8em;
 }
 
 .sb-forward-origin {
@@ -693,8 +656,6 @@ label:hover .icon-anim-drop {
   word-break: break-word;
   max-inline-size: 100%;
   box-sizing: border-box;
-  unicode-bidi: plaintext;
-  text-align: start;
 }
 
 .sb-markdown ul ul,
@@ -732,8 +693,6 @@ label:hover .icon-anim-drop {
   color: rgba(100, 116, 139, 0.95);
   max-inline-size: 100%;
   box-sizing: border-box;
-  unicode-bidi: plaintext;
-  text-align: start;
 }
 
 .dark .sb-markdown blockquote {
@@ -768,8 +727,6 @@ label:hover .icon-anim-drop {
 .sb-markdown h6 {
   margin: 0.3rem 0 0.15rem;
   font-weight: 600;
-  unicode-bidi: plaintext;
-  text-align: start;
 }
 
 .sb-markdown h1 { font-size: 1.1rem; }
