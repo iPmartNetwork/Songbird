@@ -5,6 +5,7 @@ function registerAuthRoutes(app, deps) {
     USERNAME_MAX,
     USERNAME_REGEX,
     ACCOUNT_CREATION,
+    ADMIN_USERNAMES = [],
     bcrypt,
     clearSessionCookie,
     createSession,
@@ -95,6 +96,8 @@ function registerAuthRoutes(app, deps) {
       avatarUrl: ensureAvatarExists(id, avatarUrl?.trim()) || null,
       color: assignedColor,
       status: "online",
+      role: "user",
+      isAdmin: ADMIN_USERNAMES.includes(trimmed),
     });
   });
 
@@ -132,6 +135,10 @@ function registerAuthRoutes(app, deps) {
       avatarUrl: ensureAvatarExists(user.id, user.avatar_url) || null,
       color: user.color || USER_COLORS[0],
       status: user.status || "online",
+      role: user.role || "user",
+      isAdmin:
+        String(user.role || "").toLowerCase() === "admin" ||
+        ADMIN_USERNAMES.includes(String(user.username || "").toLowerCase()),
     });
   });
 
@@ -148,6 +155,10 @@ function registerAuthRoutes(app, deps) {
       avatarUrl: ensureAvatarExists(session.id, session.avatar_url) || null,
       color: session.color || USER_COLORS[0],
       status: session.status || "online",
+      role: session.role || "user",
+      isAdmin:
+        String(session.role || "").toLowerCase() === "admin" ||
+        ADMIN_USERNAMES.includes(String(session.username || "").toLowerCase()),
     });
   });
 
