@@ -218,6 +218,11 @@ runDatabaseMigrations();
 
 saveDatabase();
 
+const USER_ROLE_SELECT_SQL = hasColumn("users", "role") ? "role" : "'user' AS role";
+const USER_ROLE_QUALIFIED_SELECT_SQL = hasColumn("users", "role")
+  ? "users.role"
+  : "'user' AS role";
+
 process.once("beforeExit", () => {
   saveDatabase();
 });
@@ -232,14 +237,14 @@ export function getCurrentSchemaVersion() {
 
 export function findUserByUsername(username) {
   return getRow(
-    "SELECT id, username, nickname, avatar_url, color, status, password_hash, banned FROM users WHERE username = ?",
+    `SELECT id, username, nickname, avatar_url, color, status, password_hash, banned, ${USER_ROLE_SELECT_SQL} FROM users WHERE username = ?`,
     [username],
   );
 }
 
 export function findUserById(id) {
   return getRow(
-    "SELECT id, username, nickname, avatar_url, color, status, password_hash, banned FROM users WHERE id = ?",
+    `SELECT id, username, nickname, avatar_url, color, status, password_hash, banned, ${USER_ROLE_SELECT_SQL} FROM users WHERE id = ?`,
     [id],
   );
 }
@@ -247,13 +252,13 @@ export function findUserById(id) {
 export function listUsers(excludeUsername) {
   if (excludeUsername) {
     return getAll(
-      "SELECT id, username, nickname, avatar_url, color, status FROM users WHERE username != ? ORDER BY username",
+      `SELECT id, username, nickname, avatar_url, color, status, banned, ${USER_ROLE_SELECT_SQL} FROM users WHERE username != ? ORDER BY username`,
       [excludeUsername],
     );
   }
 
   return getAll(
-    "SELECT id, username, nickname, avatar_url, color, status, banned FROM users ORDER BY username",
+    `SELECT id, username, nickname, avatar_url, color, status, banned, ${USER_ROLE_SELECT_SQL} FROM users ORDER BY username`,
   );
 }
 
@@ -262,13 +267,13 @@ export function searchUsers(query, excludeUsername) {
 
   if (excludeUsername) {
     return getAll(
-      "SELECT id, username, nickname, avatar_url, color, status, banned FROM users WHERE username != ? AND (username LIKE ? OR nickname LIKE ?) ORDER BY username",
+      `SELECT id, username, nickname, avatar_url, color, status, banned, ${USER_ROLE_SELECT_SQL} FROM users WHERE username != ? AND (username LIKE ? OR nickname LIKE ?) ORDER BY username`,
       [excludeUsername, like, like],
     );
   }
 
   return getAll(
-    "SELECT id, username, nickname, avatar_url, color, status, banned FROM users WHERE username LIKE ? OR nickname LIKE ? ORDER BY username",
+    `SELECT id, username, nickname, avatar_url, color, status, banned, ${USER_ROLE_SELECT_SQL} FROM users WHERE username LIKE ? OR nickname LIKE ? ORDER BY username`,
     [like, like],
   );
 }
@@ -1220,18 +1225,8 @@ export function getMessages(chatId, options = {}) {
     : "";
 
   const whereSql = `WHERE chat_messages.chat_id = ?${visibilitySql}${beforeSql}`;
-  const replyJoinVisibilitySql = hasViewerUserId
-    ? `AND ${getVisibleMessageFilterSql(
-        "reply",
-        "WHERE hidden_chat_messages.user_id = ?",
-      )}`
-    : "AND reply.hidden_everyone_at IS NULL";
 
-  const params = [];
-  if (hasViewerUserId) {
-    params.push(viewerUserIdRaw);
-  }
-  params.push(chatId);
+  const params = [chatId];
   if (hasViewerUserId) {
     params.push(viewerUserIdRaw);
   }
@@ -1244,10 +1239,8 @@ export function getMessages(chatId, options = {}) {
     `
     SELECT chat_messages.id,
       COALESCE(chat_messages.edited_body, chat_messages.body) AS body,
-      chat_messages.client_request_id,
       chat_messages.edited,
       chat_messages.edited_body,
-      chat_messages.client_request_id,
       chat_messages.forwarded_from_chat_id,
       chat_messages.forwarded_from_label,
       chat_messages.forwarded_from_user_id,
@@ -1272,9 +1265,7 @@ export function getMessages(chatId, options = {}) {
       reply_user.avatar_url AS reply_avatar_url
     FROM chat_messages
     LEFT JOIN users ON users.id = chat_messages.user_id
-    LEFT JOIN chat_messages reply
-      ON reply.id = chat_messages.reply_to_message_id
-      ${replyJoinVisibilitySql}
+    LEFT JOIN chat_messages reply ON reply.id = chat_messages.reply_to_message_id
     LEFT JOIN users reply_user ON reply_user.id = reply.user_id
     ${whereSql}
     ORDER BY julianday(chat_messages.created_at) DESC, chat_messages.id DESC
@@ -1304,11 +1295,37 @@ export function getMessages(chatId, options = {}) {
 
   const totalCount = Number(totalRow?.total || 0);
 
-  return {
-    messages: rows.map(decryptMessageRow),
-    hasMore,
-    totalCount,
-  };
+const messageIds = rows
+  .map((row) => Number(row.id || 0))
+  .filter((id) => Number.isFinite(id) && id > 0);
+
+const reactions = getMessageReactions(messageIds);
+
+const reactionsByMessageId = reactions.reduce((acc, row) => {
+  const messageId = Number(row.message_id || 0);
+  if (!messageId) return acc;
+
+  if (!acc[messageId]) acc[messageId] = [];
+
+  acc[messageId].push({
+    reaction: row.reaction,
+    count: Number(row.count || 0),
+  });
+
+  return acc;
+}, {});
+
+return {
+  messages: rows.map((row) => {
+    const message = decryptMessageRow(row);
+    return {
+      ...message,
+      reactions: reactionsByMessageId[Number(message.id || 0)] || [],
+    };
+  }),
+  hasMore,
+  totalCount,
+};
 }
 
 export function listMessageFilesByMessageIds(messageIds = []) {
@@ -1587,33 +1604,6 @@ export function deletePushSubscription(endpoint) {
   run("DELETE FROM push_subscriptions WHERE endpoint = ?", [safeEndpoint]);
 }
 
-export function getTotalUnreadCount(userId) {
-  const uid = Number(userId || 0);
-  if (!uid) return 0;
-  const row = getRow(
-    `SELECT COUNT(*) AS total
-     FROM (
-       SELECT c.id AS chat_id
-       FROM chats c
-       JOIN chat_members m ON m.chat_id = c.id AND m.user_id = ?
-       LEFT JOIN chat_mutes mu ON mu.chat_id = c.id AND mu.user_id = ? AND mu.muted = 1
-       LEFT JOIN hidden_chats h ON h.chat_id = c.id AND h.user_id = ?
-       WHERE h.chat_id IS NULL
-         AND mu.chat_id IS NULL
-     ) mc
-     JOIN chat_messages cm ON cm.chat_id = mc.chat_id
-     LEFT JOIN hidden_chat_messages hcm ON hcm.message_id = cm.id AND hcm.user_id = ?
-     LEFT JOIN chat_message_reads cmr ON cmr.message_id = cm.id AND cmr.user_id = ?
-     WHERE cm.body NOT LIKE '[[system:%]]'
-       AND cm.hidden_everyone_at IS NULL
-       AND hcm.message_id IS NULL
-       AND cm.user_id != ?
-       AND cmr.message_id IS NULL`,
-    [uid, uid, uid, uid, uid, uid],
-  );
-  return Number(row?.total || 0);
-}
-
 export function listPushSubscriptionsByUserIds(userIds = []) {
   const ids = Array.from(
     new Set(
@@ -1651,13 +1641,51 @@ export function getSession(token) {
   return getRow(
     `
     SELECT sessions.id AS session_id, sessions.token, users.id, users.username, users.nickname,
-           users.avatar_url, users.color, users.status, users.banned
+           users.avatar_url, users.color, users.status, users.banned, ${USER_ROLE_QUALIFIED_SELECT_SQL}
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.token = ?
       AND COALESCE(users.banned, 0) = 0
   `,
     [token],
+  );
+}
+
+export function toggleMessageReaction(messageId, userId, reaction) {
+  const exists = getRow(
+    "SELECT id FROM message_reactions WHERE message_id=? AND user_id=? AND reaction=?",
+    [messageId, userId, reaction]
+  );
+
+  if (exists) {
+    run(
+      "DELETE FROM message_reactions WHERE message_id=? AND user_id=? AND reaction=?",
+      [messageId, userId, reaction]
+    );
+    return { removed: true };
+  }
+
+  run(
+    "INSERT INTO message_reactions (message_id, user_id, reaction) VALUES (?, ?, ?)",
+    [messageId, userId, reaction]
+  );
+
+  return { added: true };
+}
+
+export function getMessageReactions(messageIds = []) {
+  if (!messageIds.length) return [];
+
+  const placeholders = messageIds.map(() => "?").join(",");
+
+  return getAll(
+    `
+    SELECT message_id, reaction, COUNT(*) as count
+    FROM message_reactions
+    WHERE message_id IN (${placeholders})
+    GROUP BY message_id, reaction
+    `,
+    messageIds,
   );
 }
 
